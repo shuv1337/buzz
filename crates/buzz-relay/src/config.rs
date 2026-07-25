@@ -83,6 +83,22 @@ pub struct Config {
     /// Whether REST API requests must present a valid token. Independent of
     /// WebSocket protocol auth, which is *always* required by REQ/EVENT/COUNT.
     pub require_auth_token: bool,
+    /// Whether to derive each request's external TLS posture from the
+    /// `X-Forwarded-Proto` header instead of the scheme baked into
+    /// [`Self::relay_url`].
+    ///
+    /// The NIP-98 `u`-tag and NIP-42 `relay`-tag match keys embed a scheme.
+    /// With this off, that scheme is a single deployment-wide constant, so a
+    /// relay reachable over *both* a TLS-terminating proxy (`https://host`)
+    /// and a direct/tunnelled plain-HTTP port (`http://host`) can only ever
+    /// admit one of them — the other fails with a `u`/`relay` URL mismatch.
+    ///
+    /// Enable **only** when every path to this relay traverses a proxy that
+    /// overwrites `X-Forwarded-Proto`. If clients can reach the relay socket
+    /// directly, a caller could spoof the header and replay a `https://`-signed
+    /// NIP-98 event over plain HTTP, weakening the scheme half of the URL
+    /// binding. Defaults to `false`, preserving the deployment-wide scheme.
+    pub trust_forwarded_proto: bool,
     /// Comma-separated list of allowed CORS origins.
     /// If empty, permissive CORS is used (dev mode).
     /// Example: "tauri://localhost,http://localhost:3000"
@@ -473,6 +489,10 @@ impl Config {
             .unwrap_or(15);
 
         let require_auth_token = std::env::var("BUZZ_REQUIRE_AUTH_TOKEN")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        let trust_forwarded_proto = std::env::var("BUZZ_TRUST_FORWARDED_PROTO")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
@@ -884,6 +904,7 @@ impl Config {
             slow_client_grace_limit,
             auth,
             require_auth_token,
+            trust_forwarded_proto,
             cors_origins,
             relay_private_key,
             uds_path,

@@ -325,6 +325,36 @@ but only admins/owners can set it. Full spec:
 | `BUZZ_PUBKEY_ALLOWLIST` | ❌ | `false` | Enable pubkey allowlist for NIP-42 pubkey-only auth |
 | `BUZZ_RELAY_PRIVATE_KEY` | ❌ | random | Hex secret key for relay signing (discovery events, system messages) |
 | `BUZZ_REQUIRE_AUTH_TOKEN` | ❌ | `false` | Require authenticated NIP-42 for all connections |
+| `BUZZ_TRUST_FORWARDED_PROTO` | ❌ | `false` | Derive each request's `http`/`https` (`ws`/`wss`) posture from `X-Forwarded-Proto` instead of `RELAY_URL`'s scheme |
+
+### `BUZZ_TRUST_FORWARDED_PROTO`
+
+The NIP-98 `u` tag and NIP-42 `relay` tag are matched against a URL that embeds
+a scheme. By default that scheme is a deployment-wide constant taken from
+`RELAY_URL`, so a relay reachable over more than one scheme — say a
+TLS-terminating proxy at `wss://relay.example` *and* an SSH-forwarded plain-HTTP
+port — can only ever admit one of them. The other fails with:
+
+```
+NIP-98: URL mismatch: event has `http://…`, expected `https://…`
+```
+
+Setting `BUZZ_TRUST_FORWARDED_PROTO=true` resolves the posture per request from
+the first hop of `X-Forwarded-Proto`, letting both paths authenticate against a
+single `RELAY_URL`. The host half of the match key still comes from the resolved
+tenant, so this does not widen host binding.
+
+With the flag on, an **absent** `X-Forwarded-Proto` means plain HTTP rather than
+the configured posture. The relay never terminates TLS itself, so a request
+without the header did not come through the proxy and did not arrive over TLS —
+this is what lets a tunnelled `http://` client authenticate against a `wss://`
+deployment. It is not a downgrade: that caller still has to sign the `http://`
+URL it actually used.
+
+**Only enable this when every route to the relay passes through a proxy that
+overwrites `X-Forwarded-Proto`.** If clients can reach the relay socket
+directly, a caller can assert `https` and replay a TLS-signed NIP-98 event over
+plain HTTP, weakening the scheme half of the URL binding.
 
 ---
 

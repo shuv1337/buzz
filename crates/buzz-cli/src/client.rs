@@ -526,6 +526,45 @@ pub struct BuzzClient {
     auth_tag: Option<Tag>,
     /// Raw JSON of the auth tag for the `x-auth-tag` HTTP header.
     auth_tag_json: Option<String>,
+    /// Operator-supplied headers attached to every request, for traversing an
+    /// authenticating reverse proxy in front of the relay. Already installed as
+    /// `default_headers` on `http`; retained so ad-hoc clients built for
+    /// downloads/uploads can carry them too.
+    extra_headers: reqwest::header::HeaderMap,
+}
+
+/// Parse `Name: Value` header specs into a [`reqwest::header::HeaderMap`].
+///
+/// Blank entries are skipped so a trailing newline in `BUZZ_EXTRA_HEADERS` is
+/// not an error. `Authorization` is rejected — see [`BuzzClient::new`].
+fn parse_extra_headers(specs: &[String]) -> Result<reqwest::header::HeaderMap, CliError> {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
+
+    let mut map = HeaderMap::new();
+    for spec in specs {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            continue;
+        }
+        let (name, value) = spec.split_once(':').ok_or_else(|| {
+            CliError::Usage(format!("--header must be 'Name: Value', got {spec:?}"))
+        })?;
+        let name: HeaderName = name
+            .trim()
+            .parse()
+            .map_err(|_| CliError::Usage(format!("invalid header name {:?}", name.trim())))?;
+        if name == AUTHORIZATION {
+            return Err(CliError::Usage(
+                "--header cannot set Authorization; it carries the CLI's NIP-98 signature. \
+                 Use the proxy's alternate header (e.g. X-Exedev-Authorization) or a tunnel."
+                    .into(),
+            ));
+        }
+        let value = HeaderValue::from_str(value.trim())
+            .map_err(|_| CliError::Usage(format!("invalid value for header {name}")))?;
+        map.append(name, value);
+    }
+    Ok(map)
 }
 
 impl BuzzClient {
@@ -538,15 +577,25 @@ impl BuzzClient {
     /// - `BUZZ_TIMEOUT_SECS` — per-request total timeout (default 30 s)
     ///
     /// A value of zero for either variable is treated as invalid and falls back to the default.
+    /// `extra_headers` are `Name: Value` specs attached to every request, for
+    /// authenticating reverse proxies that gate the relay (see the `--header`
+    /// flag). `Authorization` is rejected rather than silently dropped: reqwest
+    /// lets a default header be overridden per-request, so the CLI's NIP-98
+    /// signature would win and the proxy credential would vanish with no
+    /// diagnostic. Proxies that only accept `Authorization` need a distinct
+    /// header (e.g. `X-Exedev-Authorization`) or a local tunnel.
     pub fn new(
         relay_url: String,
         keys: Keys,
         auth_tag: Option<Tag>,
         auth_tag_json: Option<String>,
+        extra_headers: &[String],
     ) -> Result<Self, CliError> {
+        let default_headers = parse_extra_headers(extra_headers)?;
         let http = reqwest::Client::builder()
             .timeout(env_duration_secs("BUZZ_TIMEOUT_SECS", 30))
             .connect_timeout(env_duration_secs("BUZZ_CONNECT_TIMEOUT_SECS", 15))
+            .default_headers(default_headers.clone())
             .build()
             .map_err(|e| CliError::Other(e.to_string()))?;
         Ok(Self {
@@ -555,6 +604,7 @@ impl BuzzClient {
             keys,
             auth_tag,
             auth_tag_json,
+            extra_headers: default_headers,
         })
     }
 
@@ -1233,6 +1283,9 @@ impl BuzzClient {
             .timeout(Duration::from_secs(120))
             // Do not forward Authorization or x-auth-tag to redirect targets.
             .redirect(reqwest::redirect::Policy::none())
+            // Media lives behind the same proxy as the relay, so this dedicated
+            // client needs the proxy credential too.
+            .default_headers(self.extra_headers.clone())
             .build()
             .map_err(|e| CliError::Other(format!("http client init failed: {e}")))?;
         self.with_retry_body(|| {
@@ -1637,7 +1690,7 @@ mod retry_policy_tests {
 
     fn test_client(base_url: &str) -> BuzzClient {
         let keys = Keys::generate();
-        BuzzClient::new(base_url.to_string(), keys, None, None).unwrap()
+        BuzzClient::new(base_url.to_string(), keys, None, None, &[]).unwrap()
     }
 
     fn make_moderation_event(keys: &Keys, kind: u16) -> nostr::Event {
@@ -2297,9 +2350,50 @@ mod retry_policy_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_query_cursor, create_response_with_id, extract_relay_response_field, BuzzClient,
+        advance_query_cursor, create_response_with_id, extract_relay_response_field,
+        parse_extra_headers, BuzzClient,
     };
     use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    #[test]
+    fn parse_extra_headers_accepts_name_value_pairs() {
+        let map = parse_extra_headers(&[
+            "X-Exedev-Authorization: Bearer tok123".to_string(),
+            "X-Trace:  abc  ".to_string(),
+        ])
+        .expect("valid headers");
+        assert_eq!(map.get("x-exedev-authorization").unwrap(), "Bearer tok123");
+        assert_eq!(map.get("x-trace").unwrap(), "abc");
+    }
+
+    /// A trailing newline in `BUZZ_EXTRA_HEADERS` yields an empty spec; that is
+    /// formatting, not a usage error.
+    #[test]
+    fn parse_extra_headers_skips_blank_specs() {
+        let map = parse_extra_headers(&["".to_string(), "   ".to_string()]).expect("blanks are ok");
+        assert!(map.is_empty());
+    }
+
+    /// Silently dropping this would be the dangerous outcome: reqwest lets the
+    /// per-request NIP-98 `Authorization` override a default header, so the
+    /// proxy credential would vanish with no diagnostic.
+    #[test]
+    fn parse_extra_headers_rejects_authorization() {
+        let err = parse_extra_headers(&["Authorization: Bearer tok".to_string()])
+            .expect_err("must reject");
+        assert!(
+            err.to_string().contains("NIP-98"),
+            "error should explain the collision, got: {err}"
+        );
+        // Case-insensitive: header names are ASCII-case-insensitive.
+        assert!(parse_extra_headers(&["authorization: Bearer tok".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parse_extra_headers_rejects_malformed_specs() {
+        assert!(parse_extra_headers(&["no-colon-here".to_string()]).is_err());
+        assert!(parse_extra_headers(&["Bad Name: value".to_string()]).is_err());
+    }
 
     #[test]
     fn query_cursor_uses_last_events_composite_sort_key() {
@@ -2379,6 +2473,7 @@ mod tests {
             keys,
             Some(auth_tag),
             Some(auth_json),
+            &[],
         )
         .unwrap();
 
@@ -2407,6 +2502,7 @@ mod tests {
             keys,
             Some(auth_tag),
             Some(auth_json),
+            &[],
         )
         .unwrap();
 
@@ -2444,6 +2540,7 @@ mod tests {
             keys,
             Some(auth_tag),
             Some(auth_json.clone()),
+            &[],
         )
         .unwrap();
 
@@ -2464,7 +2561,7 @@ mod tests {
     #[test]
     fn with_auth_tag_omits_header_when_not_configured() {
         let keys = Keys::generate();
-        let client = BuzzClient::new("https://test.relay".into(), keys, None, None).unwrap();
+        let client = BuzzClient::new("https://test.relay".into(), keys, None, None, &[]).unwrap();
 
         let req = client.http.post("https://test.relay/events");
         let req = client.with_auth_tag(req);

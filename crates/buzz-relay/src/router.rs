@@ -297,6 +297,15 @@ async fn nip11_or_ws_handler(
         }
     };
 
+    // Same seam as the tenant bind above: resolve the external TLS posture from
+    // the request, so the NIP-42 `relay`-tag match key reflects how the client
+    // actually connected rather than one deployment-wide constant.
+    let client_tls = crate::api::bridge::client_used_tls(
+        &state.config.relay_url,
+        &headers,
+        state.config.trust_forwarded_proto,
+    );
+
     let max_frame_bytes = state.config.max_frame_bytes;
     match WebSocketUpgrade::from_request(req, &state).await {
         Ok(ws) => {
@@ -310,7 +319,9 @@ async fn nip11_or_ws_handler(
                 return (StatusCode::SERVICE_UNAVAILABLE, "relay restarting").into_response();
             }
             limit_relay_websocket(ws, max_frame_bytes)
-                .on_upgrade(move |socket| handle_connection(socket, state, addr, tenant))
+                .on_upgrade(move |socket| {
+                    handle_connection(socket, state, addr, tenant, client_tls)
+                })
                 .into_response()
         }
         Err(_) => {

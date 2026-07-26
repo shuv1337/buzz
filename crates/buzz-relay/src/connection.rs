@@ -57,6 +57,12 @@ pub struct ConnectionState {
     /// host at row zero (before any frame is read) and never overridable by
     /// client-supplied input. Every handler reads tenant scope from here.
     pub tenant: TenantContext,
+    /// Whether the *external* client reached this connection over TLS, resolved
+    /// at the same row-zero seam as [`Self::tenant`] (see
+    /// [`crate::api::bridge::client_used_tls`]). Drives the `ws://` vs `wss://`
+    /// scheme of the NIP-42 `relay`-tag match key, so a relay served both
+    /// directly and behind a TLS proxy can admit both.
+    pub client_tls: bool,
     /// Remote socket address of the client.
     pub remote_addr: SocketAddr,
     /// Current NIP-42 authentication state.
@@ -120,6 +126,7 @@ pub async fn handle_connection(
     state: Arc<AppState>,
     addr: SocketAddr,
     tenant: TenantContext,
+    client_tls: bool,
 ) {
     let conn_id = Uuid::new_v4();
     let cancel = CancellationToken::new();
@@ -133,16 +140,20 @@ pub async fn handle_connection(
         community_id,
         cancel.clone(),
         move || async move { check_state.db.is_community_active(community_id).await },
-        move || handle_active_connection(socket, run_state, addr, tenant, conn_id, cancel),
+        move || {
+            handle_active_connection(socket, run_state, addr, tenant, client_tls, conn_id, cancel)
+        },
     )
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_active_connection(
     socket: WebSocket,
     state: Arc<AppState>,
     addr: SocketAddr,
     tenant: TenantContext,
+    client_tls: bool,
     conn_id: Uuid,
     cancel: CancellationToken,
 ) {
@@ -167,6 +178,7 @@ async fn handle_active_connection(
     let conn = Arc::new(ConnectionState {
         conn_id,
         tenant,
+        client_tls,
         remote_addr: addr,
         auth_state: RwLock::new(AuthState::Pending {
             challenge: challenge.clone(),

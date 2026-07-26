@@ -87,6 +87,14 @@ pub async fn ws_audio_handler(
         }
     };
 
+    // Same seam as the tenant bind above: the NIP-42 `relay`-tag scheme must
+    // reflect how this client actually connected, not one deployment constant.
+    let client_tls = crate::api::bridge::client_used_tls(
+        &state.config.relay_url,
+        &headers,
+        state.config.trust_forwarded_proto,
+    );
+
     let permit = match acquire_audio_connection_permit(&state.conn_semaphore) {
         Some(permit) => permit,
         None => {
@@ -103,7 +111,7 @@ pub async fn ws_audio_handler(
     // checks in the receive loop still distinguish text from binary policy, but
     // they run after tungstenite has assembled a message.
     limit_audio_websocket(ws).on_upgrade(move |socket| {
-        handle_audio_connection(socket, state, tenant, channel_id, permit)
+        handle_audio_connection(socket, state, tenant, client_tls, channel_id, permit)
     })
 }
 
@@ -141,10 +149,12 @@ fn default_protocol_version() -> u8 {
     1
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_audio_connection(
     socket: WebSocket,
     state: Arc<AppState>,
     tenant: TenantContext,
+    client_tls: bool,
     channel_id: Uuid,
     _permit: OwnedSemaphorePermit,
 ) {
@@ -159,15 +169,21 @@ async fn handle_audio_connection(
         community_id,
         cancel.clone(),
         move || async move { check_state.db.is_community_active(community_id).await },
-        move || handle_active_audio_connection(socket, run_state, tenant, channel_id, cancel),
+        move || {
+            handle_active_audio_connection(
+                socket, run_state, tenant, client_tls, channel_id, cancel,
+            )
+        },
     )
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_active_audio_connection(
     socket: WebSocket,
     state: Arc<AppState>,
     tenant: TenantContext,
+    client_tls: bool,
     channel_id: Uuid,
     cancel: CancellationToken,
 ) {
@@ -216,7 +232,9 @@ async fn handle_active_audio_connection(
     // Extract NIP-OA auth tag before verify_auth_event consumes the event.
     let auth_tag_json = crate::handlers::auth::extract_auth_tag_json(&auth_msg.event);
 
-    let relay_url = crate::api::bridge::nip42_expected_relay_url(&state.config.relay_url, &tenant);
+    let posture_url =
+        crate::api::bridge::relay_url_for_posture(&state.config.relay_url, client_tls);
+    let relay_url = crate::api::bridge::nip42_expected_relay_url(&posture_url, &tenant);
     let auth_ctx = match state
         .auth
         .verify_auth_event(auth_msg.event, &challenge, &relay_url)

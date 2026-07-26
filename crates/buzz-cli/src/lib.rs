@@ -89,6 +89,16 @@ struct Cli {
     #[arg(long, env = "BUZZ_AUTH_TAG")]
     auth_tag: Option<String>,
 
+    /// Extra HTTP header sent with every relay request, as `Name: Value`.
+    /// Repeatable; via `BUZZ_EXTRA_HEADERS` use one `Name: Value` per line.
+    ///
+    /// For reaching a relay behind an authenticating reverse proxy — e.g. an
+    /// exe.dev private VM proxy wants
+    /// `--header 'X-Exedev-Authorization: Bearer <token>'`. Cannot be used to
+    /// set `Authorization`, which carries the CLI's own NIP-98 signature.
+    #[arg(long = "header", env = "BUZZ_EXTRA_HEADERS", value_delimiter = '\n')]
+    headers: Vec<String>,
+
     /// Output format: 'json' (default, full fields) or 'compact' (reduced fields).
     #[arg(long, value_enum, default_value = "json")]
     format: OutputFormat,
@@ -1765,7 +1775,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         _ => (None, None),
     };
 
-    let client = BuzzClient::new(relay_url, keys, auth_tag, auth_tag_json)?;
+    let client = BuzzClient::new(relay_url, keys, auth_tag, auth_tag_json, &cli.headers)?;
 
     match cli.command {
         Cmd::Agents(sub) => commands::agents::dispatch(sub, &client).await,

@@ -3,6 +3,7 @@
 //! These endpoints provide HTTP access to the relay's Nostr protocol,
 //! authenticated via NIP-98 signed events.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use axum::{
@@ -173,6 +174,72 @@ async fn check_nip98_replay_with_guard(
             ))
         }
     }
+}
+
+/// Resolve the relay URL whose scheme reflects *this request's* external TLS
+/// posture, for feeding to [`nip98_expected_url`] / [`nip42_expected_relay_url`].
+///
+/// Both helpers read only the `ws://` vs `wss://` prefix of what they are given,
+/// to decide whether the client signed an `http`/`ws` or `https`/`wss` URL.
+/// `config.relay_url` encodes that as one deployment-wide constant, which breaks
+/// any relay reachable over more than one scheme — e.g. a TLS-terminating proxy
+/// *and* an SSH-forwarded plain-HTTP port. `client_tls` (from `X-Forwarded-Proto`
+/// at the request seam) makes the posture per-request instead.
+///
+/// Only the scheme is substituted. The host still comes from the resolved
+/// [`TenantContext`], so this cannot reintroduce the cross-host hole documented
+/// on [`nip98_expected_url`].
+pub(crate) fn relay_url_for_posture(config_relay_url: &str, client_tls: bool) -> Cow<'_, str> {
+    let trimmed = config_relay_url.trim_start();
+    let configured_tls = trimmed.starts_with("wss://");
+    if configured_tls == client_tls {
+        return Cow::Borrowed(config_relay_url);
+    }
+    match (configured_tls, trimmed.strip_prefix("ws://")) {
+        (true, _) => Cow::Owned(format!(
+            "ws://{}",
+            trimmed.strip_prefix("wss://").unwrap_or(trimmed)
+        )),
+        (false, Some(rest)) => Cow::Owned(format!("wss://{rest}")),
+        // Not a ws/wss URL at all: leave it alone rather than invent a scheme.
+        (false, None) => Cow::Borrowed(config_relay_url),
+    }
+}
+
+/// Whether the *external* client reached this request over TLS.
+///
+/// With `BUZZ_TRUST_FORWARDED_PROTO` on, this is read from `X-Forwarded-Proto`
+/// — only its first value, the hop nearest the client. With it off, it is the
+/// deployment-wide posture encoded in `config_relay_url`.
+///
+/// When trusting the header, its *absence* means plain HTTP, not the configured
+/// posture. The relay never terminates TLS itself (it always binds a plain
+/// socket), so a request carrying no `X-Forwarded-Proto` did not come through
+/// the proxy and therefore did not arrive over TLS — this is what lets a
+/// tunnelled `http://` client authenticate against a `wss://` deployment. That
+/// direction is not a downgrade: such a caller must still sign the `http://`
+/// URL it actually used, so it gains nothing it could not already do.
+///
+/// The trust gate is load-bearing in the *other* direction: without it, any
+/// caller reaching the relay socket directly could assert `https` and replay a
+/// TLS-signed NIP-98 event over plain HTTP.
+pub(crate) fn client_used_tls(
+    config_relay_url: &str,
+    headers: &HeaderMap,
+    trust_forwarded_proto: bool,
+) -> bool {
+    if trust_forwarded_proto {
+        return headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .is_some_and(|proto| {
+                proto.eq_ignore_ascii_case("https") || proto.eq_ignore_ascii_case("wss")
+            });
+    }
+    config_relay_url.trim_start().starts_with("wss://")
 }
 
 /// Construct the NIP-98 `u`-tag expected URL for a request bound to `tenant`.
@@ -632,7 +699,15 @@ pub async fn submit_event(
             )
         })?;
 
-    let url = nip98_expected_url(&state.config.relay_url, &tenant, "/events");
+    let relay_url = relay_url_for_posture(
+        &state.config.relay_url,
+        client_used_tls(
+            &state.config.relay_url,
+            &headers,
+            state.config.trust_forwarded_proto,
+        ),
+    );
+    let url = nip98_expected_url(&relay_url, &tenant, "/events");
     let (pubkey, event_id_bytes) = verify_bridge_auth(
         &headers,
         "POST",
@@ -900,7 +975,15 @@ pub async fn query_events(
             )
         })?;
 
-    let url = nip98_expected_url(&state.config.relay_url, &tenant, "/query");
+    let relay_url = relay_url_for_posture(
+        &state.config.relay_url,
+        client_used_tls(
+            &state.config.relay_url,
+            &headers,
+            state.config.trust_forwarded_proto,
+        ),
+    );
+    let url = nip98_expected_url(&relay_url, &tenant, "/query");
     let (pubkey, event_id_bytes) = verify_bridge_auth(
         &headers,
         "POST",
@@ -1333,7 +1416,15 @@ pub async fn count_events(
             )
         })?;
 
-    let url = nip98_expected_url(&state.config.relay_url, &tenant, "/count");
+    let relay_url = relay_url_for_posture(
+        &state.config.relay_url,
+        client_used_tls(
+            &state.config.relay_url,
+            &headers,
+            state.config.trust_forwarded_proto,
+        ),
+    );
+    let url = nip98_expected_url(&relay_url, &tenant, "/count");
     let (pubkey, event_id_bytes) = verify_bridge_auth(
         &headers,
         "POST",
@@ -2028,7 +2119,15 @@ async fn authorize_moderation_read(
         Some(q) if !q.is_empty() => format!("{path}?{q}"),
         _ => path.to_string(),
     };
-    let url = nip98_expected_url(&state.config.relay_url, &tenant, &path_with_query);
+    let relay_url = relay_url_for_posture(
+        &state.config.relay_url,
+        client_used_tls(
+            &state.config.relay_url,
+            headers,
+            state.config.trust_forwarded_proto,
+        ),
+    );
+    let url = nip98_expected_url(&relay_url, &tenant, &path_with_query);
     let (pubkey, event_id_bytes) =
         verify_bridge_auth(headers, "GET", &url, None, state.config.require_auth_token)?;
     check_nip98_replay(state, &tenant, event_id_bytes).await?;
@@ -2668,6 +2767,144 @@ mod tests {
             nip98_expected_url("ws://config.example", &tenant, "/events"),
             "http://host-a.example/events",
             "ws:// dev config → http:// URL"
+        );
+    }
+
+    // ----- Per-request TLS posture (`X-Forwarded-Proto`) -----
+
+    fn headers_with_proto(proto: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", proto.parse().expect("header value"));
+        h
+    }
+
+    /// The trust gate is the whole security story: an untrusted deployment must
+    /// ignore `X-Forwarded-Proto` entirely, so a caller reaching the relay
+    /// socket directly cannot assert `https` and replay a TLS-signed NIP-98
+    /// event over plain HTTP.
+    #[test]
+    fn client_used_tls_ignores_forwarded_proto_unless_trusted() {
+        let spoofed = headers_with_proto("https");
+        assert!(
+            !client_used_tls("ws://config.example", &spoofed, false),
+            "untrusted deployment must fall back to the ws:// config posture"
+        );
+        assert!(
+            client_used_tls("wss://config.example", &headers_with_proto("http"), false),
+            "untrusted deployment must fall back to the wss:// config posture"
+        );
+    }
+
+    #[test]
+    fn client_used_tls_reads_forwarded_proto_when_trusted() {
+        assert!(client_used_tls(
+            "ws://config.example",
+            &headers_with_proto("https"),
+            true
+        ));
+        assert!(!client_used_tls(
+            "wss://config.example",
+            &headers_with_proto("http"),
+            true
+        ));
+    }
+
+    /// Proxy chains append, so the client-nearest hop is the first entry.
+    #[test]
+    fn client_used_tls_reads_first_hop_of_a_chain() {
+        assert!(client_used_tls(
+            "ws://config.example",
+            &headers_with_proto("https, http"),
+            true
+        ));
+        assert!(!client_used_tls(
+            "wss://config.example",
+            &headers_with_proto("http, https"),
+            true
+        ));
+    }
+
+    /// The tunnel case, and the reason this feature exists: a `wss://`
+    /// deployment must still admit a client that reached the relay socket
+    /// directly over plain HTTP. No `X-Forwarded-Proto` means the request never
+    /// traversed the TLS-terminating proxy, so the posture is plain — even
+    /// though the deployment constant says `wss://`.
+    #[test]
+    fn client_used_tls_treats_absent_header_as_plain_when_trusted() {
+        let empty = HeaderMap::new();
+        assert!(!client_used_tls("wss://config.example", &empty, true));
+        assert!(!client_used_tls("ws://config.example", &empty, true));
+    }
+
+    /// With trust off, an absent header must not change anything.
+    #[test]
+    fn client_used_tls_falls_back_to_config_when_untrusted() {
+        let empty = HeaderMap::new();
+        assert!(client_used_tls("wss://config.example", &empty, false));
+        assert!(!client_used_tls("ws://config.example", &empty, false));
+    }
+
+    #[test]
+    fn relay_url_for_posture_swaps_only_the_scheme() {
+        assert_eq!(
+            relay_url_for_posture("wss://config.example", false),
+            "ws://config.example"
+        );
+        assert_eq!(
+            relay_url_for_posture("ws://config.example", true),
+            "wss://config.example"
+        );
+        // Matching posture is a no-op (and stays borrowed).
+        assert_eq!(
+            relay_url_for_posture("wss://config.example", true),
+            "wss://config.example"
+        );
+        assert_eq!(
+            relay_url_for_posture("ws://config.example", false),
+            "ws://config.example"
+        );
+    }
+
+    /// End-to-end of the reason this exists: one relay, one config string, both
+    /// a TLS proxy hop and a plain-HTTP tunnel hop produce a matching `u` tag.
+    #[test]
+    fn posture_lets_one_deployment_serve_both_schemes() {
+        let tenant = fresh_tenant("buzz-ci.exe.xyz");
+        let config = "wss://buzz-ci.exe.xyz";
+
+        let via_proxy = relay_url_for_posture(config, true);
+        assert_eq!(
+            nip98_expected_url(&via_proxy, &tenant, "/query"),
+            "https://buzz-ci.exe.xyz/query"
+        );
+
+        let via_tunnel = relay_url_for_posture(config, false);
+        assert_eq!(
+            nip98_expected_url(&via_tunnel, &tenant, "/query"),
+            "http://buzz-ci.exe.xyz/query"
+        );
+
+        // NIP-42 sibling keeps ws/wss rather than http/https.
+        assert_eq!(
+            nip42_expected_relay_url(&via_tunnel, &tenant),
+            "ws://buzz-ci.exe.xyz"
+        );
+        assert_eq!(
+            nip42_expected_relay_url(&via_proxy, &tenant),
+            "wss://buzz-ci.exe.xyz"
+        );
+    }
+
+    /// Posture must never become a second way to cross host boundaries — the
+    /// host still comes from the resolved tenant, not the config URL.
+    #[test]
+    fn posture_does_not_reintroduce_config_host() {
+        let tenant = fresh_tenant("tenant-host.example");
+        let swapped = relay_url_for_posture("wss://config-host.example", false);
+        assert_eq!(
+            nip98_expected_url(&swapped, &tenant, "/events"),
+            "http://tenant-host.example/events",
+            "scheme may follow the request; host must follow the tenant"
         );
     }
 

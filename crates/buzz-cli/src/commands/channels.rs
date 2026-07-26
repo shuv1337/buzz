@@ -1354,7 +1354,7 @@ mod tests {
         let keys =
             nostr::Keys::parse("0000000000000000000000000000000000000000000000000000000000000001")
                 .expect("valid test key");
-        BuzzClient::new("ws://localhost:3000".to_string(), keys, None, None)
+        BuzzClient::new("ws://localhost:3000".to_string(), keys, None, None, &[])
             .expect("client construction should not fail")
     }
 
